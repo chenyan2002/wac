@@ -266,6 +266,9 @@ pub enum NodeKind {
     Instantiation(HashSet<usize>),
     /// The node is an alias of an export of an instance.
     Alias,
+    /// The node is the component of a package, as a value: it can be passed
+    /// to a component-typed import of an instantiation.
+    Component,
 }
 
 /// Represents a package registered with a composition graph.
@@ -422,12 +425,14 @@ impl fmt::Debug for Edge {
 /// Types may be defined directly in a composition graph or referenced from packages registered with
 /// the graph.
 ///
-/// There are four supported node types:
+/// There are five supported node types:
 ///
 /// * a *type definition node* representing the definition of an exported named type.
 /// * an *import node* representing an imported item.
 /// * an *instantiation node* representing an instantiation of a package.
 /// * an *alias node* representing an alias of an exported item from an instance.
+/// * a *component node* representing a package's component itself, for passing to a
+///   component-typed import.
 ///
 /// There are three supported edge types:
 ///
@@ -776,6 +781,31 @@ impl CompositionGraph {
         let index = self.graph.add_node(node);
         log::debug!(
             "adding instantiation of package `{key}` to the graph as node index {index}",
+            key = self[package].key(),
+            index = index.index()
+        );
+        NodeId(index)
+    }
+
+    /// Adds a *component node* to the graph: the component of a package, as a
+    /// value rather than an instance of it.
+    ///
+    /// Use `set_instantiation_argument` to pass it to a component-typed import
+    /// of an instantiation.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if the provided package id is invalid.
+    pub fn component(&mut self, package: PackageId) -> NodeId {
+        let pkg = &self[package];
+        let node = Node::new(
+            NodeKind::Component,
+            ItemKind::Component(pkg.ty()),
+            Some(package),
+        );
+        let index = self.graph.add_node(node);
+        log::debug!(
+            "adding component of package `{key}` to the graph as node index {index}",
             key = self[package].key(),
             index = index.index()
         );
@@ -1341,6 +1371,10 @@ impl fmt::Debug for CompositionGraph {
                     let (_, source) = self.get_alias_source(NodeId(i)).unwrap();
                     format!(r#"alias of export \"{source}\""#)
                 }
+                NodeKind::Component => {
+                    let package = &self[node.package.unwrap()];
+                    format!(r#"component of package \"{key}\""#, key = package.key())
+                }
             };
 
             let mut desc = String::new();
@@ -1438,6 +1472,9 @@ impl<'a> CompositionGraphEncoder<'a> {
                 NodeKind::Definition => self.definition(&mut state, node),
                 NodeKind::Instantiation(_) => self.instantiation(&mut state, n, node, options),
                 NodeKind::Alias => self.alias(&mut state, n),
+                NodeKind::Component => {
+                    self.package_component(&mut state, node.package.unwrap(), options)
+                }
                 // `other_nodes` does not contain any import nodes
                 NodeKind::Import(_) => unreachable!(),
             };
@@ -1794,24 +1831,7 @@ impl<'a> CompositionGraphEncoder<'a> {
         let package_id = node.package.expect("instantiation requires a package");
         let package = self.0.packages[package_id.index].package.as_ref().unwrap();
         let imports = &self.0.types[package.ty()].imports;
-
-        let component_index = if let Some(index) = state.packages.get(&package_id) {
-            *index
-        } else {
-            let index = if options.define_components {
-                state.builder().component_raw(None, package.bytes())
-            } else {
-                let encoder = TypeEncoder::new(&self.0.types);
-                let ty = encoder.component(state, package.ty());
-                state.builder().import(
-                    Self::package_import_name(package),
-                    ComponentTypeRef::Component(ty),
-                )
-            };
-
-            state.packages.insert(package_id, index);
-            index
-        };
+        let component_index = self.package_component(state, package_id, options);
 
         let mut arguments = Vec::with_capacity(imports.len());
         arguments.extend(
@@ -1852,6 +1872,33 @@ impl<'a> CompositionGraphEncoder<'a> {
             package = package.name(),
         );
 
+        index
+    }
+
+    /// The component index of a package: defined (or imported, if components
+    /// aren't defined) the first time it's used, by an instantiation or a
+    /// component node.
+    fn package_component(
+        &self,
+        state: &mut State,
+        package_id: PackageId,
+        options: EncodeOptions,
+    ) -> u32 {
+        if let Some(index) = state.packages.get(&package_id) {
+            return *index;
+        }
+        let package = self.0.packages[package_id.index].package.as_ref().unwrap();
+        let index = if options.define_components {
+            state.builder().component_raw(None, package.bytes())
+        } else {
+            let encoder = TypeEncoder::new(&self.0.types);
+            let ty = encoder.component(state, package.ty());
+            state.builder().import(
+                Self::package_import_name(package),
+                ComponentTypeRef::Component(ty),
+            )
+        };
+        state.packages.insert(package_id, index);
         index
     }
 

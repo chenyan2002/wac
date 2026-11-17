@@ -6,7 +6,7 @@ use std::{
 use anyhow::{bail, Context as _, Error, Result};
 use clap::Args;
 use std::str::FromStr;
-use wac_graph::{CompositionGraph, EncodeOptions};
+use wac_graph::{CompositionGraph, EncodeOptions, Plug};
 use wac_types::Package;
 
 #[cfg(feature = "registry")]
@@ -62,15 +62,57 @@ impl std::fmt::Display for PackageRef {
     }
 }
 
+/// A `--plug` argument: a plug, optionally prefixed by the socket's
+/// component-typed import (hole) it fills, as `<hole>=<plug>`.
+#[derive(Clone, Debug)]
+pub struct PlugArg {
+    /// The hole to fill, if named.
+    pub hole: Option<String>,
+    /// The plug.
+    pub package: PackageRef,
+}
+
+impl FromStr for PlugArg {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // A hole's name is a plain component name: lowercase kebab-case
+        // words, each starting with a letter.
+        let is_hole_name = |name: &str| {
+            !name.is_empty()
+                && name.split('-').all(|w| {
+                    w.starts_with(|c: char| c.is_ascii_lowercase())
+                        && w.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                })
+        };
+        match s.split_once('=') {
+            Some((hole, plug)) if is_hole_name(hole) => Ok(Self {
+                hole: Some(hole.to_string()),
+                package: plug.parse()?,
+            }),
+            _ => Ok(Self {
+                hole: None,
+                package: s.parse()?,
+            }),
+        }
+    }
+}
+
 /// Plugs the exports of any number of 'plug' components into the imports of a 'socket' component.
+///
+/// A plug whose component fits a component-typed import of the socket (a
+/// *hole*) is passed to it instead.
 #[derive(Args)]
 #[clap(disable_version_flag = true)]
 pub struct PlugCommand {
     /// The local path to the plug component or the registry package name.
     ///
-    /// More than one plug can be supplied.
+    /// More than one plug can be supplied. A plug that fits a
+    /// component-typed import of the socket (a hole) fills it; to choose the
+    /// hole, prefix the plug with its name: `<hole>=<PLUG_PATH>`.
     #[clap(long = "plug", value_name = "PLUG_PATH", required = true)]
-    pub plugs: Vec<PackageRef>,
+    pub plugs: Vec<PlugArg>,
 
     /// The local path to the socket component or the registry package name.
     #[clap(value_name = "SOCKET_PATH", required = true)]
@@ -159,13 +201,13 @@ impl PlugCommand {
         // order vary between runs on identical inputs.
         let mut plugs_by_name = indexmap::IndexMap::<_, Vec<_>>::new();
         for plug in self.plugs.iter() {
-            let name = match plug {
+            let name = match &plug.package {
                 #[cfg(feature = "registry")]
                 PackageRef::RegistryPackage((name, _)) => std::borrow::Cow::Borrowed(name.as_ref()),
                 PackageRef::LocalPath(path) => path
                     .file_stem()
                     .map(|fs| fs.to_string_lossy())
-                    .with_context(|| format!("path to plug '{}' was not a file", plug))?,
+                    .with_context(|| format!("path to plug '{}' was not a file", plug.package))?,
             };
 
             // TODO(rylev): sanitize the name to ensure it's a valid package identifier.
@@ -176,8 +218,8 @@ impl PlugCommand {
 
         // Plug each plug into the socket.
         for (name, plug_refs) in plugs_by_name {
-            for (i, plug_ref) in plug_refs.iter().enumerate() {
-                let (mut name, path) = match plug_ref {
+            for (i, plug_arg) in plug_refs.iter().enumerate() {
+                let (mut name, path) = match &plug_arg.package {
                     #[cfg(feature = "registry")]
                     PackageRef::RegistryPackage((name, version)) => {
                         if client.is_none() {
@@ -229,11 +271,14 @@ impl PlugCommand {
 
                 let plug_package = Package::from_file(&name, None, &path, graph.types_mut())?;
                 let package_id = graph.register_package(plug_package)?;
-                plug_packages.push(package_id);
+                plug_packages.push(Plug {
+                    package: package_id,
+                    hole: plug_arg.hole.clone(),
+                });
             }
         }
 
-        wac_graph::plug(&mut graph, plug_packages, socket)?;
+        wac_graph::plug_with(&mut graph, plug_packages, socket)?;
 
         let mut bytes = graph.encode(EncodeOptions::default())?;
 
